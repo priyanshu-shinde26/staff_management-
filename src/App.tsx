@@ -5,7 +5,7 @@ import {
   Download, UserCheck, UserPlus, X, MapPin, Clock, Home, Wallet, UserCircle2, PanelLeftClose, PanelLeftOpen
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut as firebaseSignOut } from 'firebase/auth';
-import { collection, doc, getDoc, getDocs, setDoc, writeBatch } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, onSnapshot, setDoc, writeBatch } from 'firebase/firestore';
 import { auth, firestoreDb } from './firebase';
 
 // --- TYPES & INTERFACES ---
@@ -324,6 +324,7 @@ export default function App() {
   const [view, setView] = useState('dashboard');
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
   
   // App Data State
   const [users, setUsers] = useState<User[]>([]);
@@ -456,6 +457,89 @@ export default function App() {
   useEffect(() => {
     setEventsPage(1);
   }, [eventsSearch]);
+
+  useEffect(() => {
+    if (!currentUser) {
+      setSyncStatus('connecting');
+      return;
+    }
+
+    setSyncStatus('connecting');
+    let usersReady = false;
+    let eventsReady = false;
+    let assignmentsReady = false;
+    const markReady = () => {
+      if (usersReady && eventsReady && assignmentsReady) {
+        setSyncStatus('connected');
+      }
+    };
+
+    const unsubUsers = onSnapshot(
+      collection(firestoreDb, COLLECTIONS.users),
+      (snap) => {
+        const nextUsers = snap.docs.map((d) => {
+          const data = d.data() as Partial<User>;
+          return {
+            ...(data as User),
+            id: (data.id as string) || d.id
+          } as User;
+        });
+        setUsers(nextUsers);
+        usersReady = true;
+        markReady();
+      },
+      (error) => {
+        setSyncStatus('error');
+        console.error('Users snapshot failed:', error);
+      }
+    );
+
+    const unsubEvents = onSnapshot(
+      collection(firestoreDb, COLLECTIONS.events),
+      (snap) => {
+        const nextEvents = snap.docs.map((d) => {
+          const data = d.data() as Partial<CateringEvent>;
+          return {
+            ...(data as CateringEvent),
+            id: (data.id as string) || d.id
+          } as CateringEvent;
+        });
+        setEvents(nextEvents);
+        eventsReady = true;
+        markReady();
+      },
+      (error) => {
+        setSyncStatus('error');
+        console.error('Events snapshot failed:', error);
+      }
+    );
+
+    const unsubAssignments = onSnapshot(
+      collection(firestoreDb, COLLECTIONS.assignments),
+      (snap) => {
+        const nextAssignments = snap.docs.map((d) => {
+          const data = d.data() as Partial<Assignment>;
+          return {
+            ...(data as Assignment),
+            id: (data.id as string) || d.id
+          } as Assignment;
+        });
+        setAssignments(nextAssignments);
+        assignmentsReady = true;
+        markReady();
+      },
+      (error) => {
+        setSyncStatus('error');
+        console.error('Assignments snapshot failed:', error);
+      }
+    );
+
+    return () => {
+      unsubUsers();
+      unsubEvents();
+      unsubAssignments();
+    };
+  }, [currentUser]);
 
   const refreshData = async () => {
     const [usersResult, eventsResult, assignmentsResult] = await Promise.allSettled([
@@ -810,6 +894,13 @@ export default function App() {
     { label: 'Profile', icon: UserCircle2, targetView: 'dashboard' }
   ];
   const bottomNavItems = currentUser.role === 'Manager' ? managerNav : staffNav;
+  const syncPillClass =
+    syncStatus === 'connected'
+      ? 'bg-emerald-100 text-emerald-700'
+      : syncStatus === 'error'
+      ? 'bg-red-100 text-red-700'
+      : 'bg-amber-100 text-amber-700';
+  const syncLabel = syncStatus === 'connected' ? 'Synced' : syncStatus === 'error' ? 'Sync issue' : 'Syncing';
 
   const NavButton = ({ label, icon: Icon, targetView }: any) => (
     <button 
@@ -876,9 +967,15 @@ export default function App() {
             <h1 className="text-lg md:text-2xl font-bold text-slate-800">{pageTitles[view] || 'Dashboard'}</h1>
             <p className="text-xs md:text-sm text-slate-500">Logged in as {currentUser.role}</p>
           </div>
-          <button onClick={handleLogout} className="md:hidden min-h-11 px-4 rounded-xl text-white text-sm font-semibold" style={{ backgroundColor: APP_COLORS.secondary }}>
-            Logout
-          </button>
+          <div className="flex items-center gap-3">
+            <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold ${syncPillClass}`}>
+              <span className="h-1.5 w-1.5 rounded-full bg-current" />
+              {syncLabel}
+            </span>
+            <button onClick={handleLogout} className="md:hidden min-h-11 px-4 rounded-xl text-white text-sm font-semibold" style={{ backgroundColor: APP_COLORS.secondary }}>
+              Logout
+            </button>
+          </div>
         </header>
         <div className="p-4 md:p-8 space-y-6">
         
