@@ -5,7 +5,7 @@ import {
   Download, UserCheck, UserPlus, X, MapPin, Clock, Home, Wallet, UserCircle2, PanelLeftClose, PanelLeftOpen
 } from 'lucide-react';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut as firebaseSignOut } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, setDoc, writeBatch } from 'firebase/firestore';
 import { auth, firestoreDb } from './firebase';
 
 // --- TYPES & INTERFACES ---
@@ -114,22 +114,87 @@ const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
 // --- SERVICES (Simulating Backend) ---
 
-const DB = {
-  getUsers: (): User[] => JSON.parse(localStorage.getItem('mbc_users') || '[]'),
-  setUsers: (users: User[]) => localStorage.setItem('mbc_users', JSON.stringify(users)),
-  getEvents: (): CateringEvent[] => JSON.parse(localStorage.getItem('mbc_events') || '[]'),
-  setEvents: (events: CateringEvent[]) => localStorage.setItem('mbc_events', JSON.stringify(events)),
-  getAssignments: (): Assignment[] => JSON.parse(localStorage.getItem('mbc_assignments') || '[]'),
-  setAssignments: (asg: Assignment[]) => localStorage.setItem('mbc_assignments', JSON.stringify(asg)),
-  
-  init: () => {
-    const existingUsers = JSON.parse(localStorage.getItem('mbc_users') || '[]');
-    const needsReseed = existingUsers.length === 0 || 
-      (existingUsers.some((u: User) => u.name.includes("Adarsh") && u.email.includes("@mbc.com")));
+const COLLECTIONS = {
+  users: 'users',
+  events: 'events',
+  assignments: 'assignments'
+} as const;
 
-    if (needsReseed) {
-      console.log("Seeding Database with new credentials...");
-      const staffUsers: User[] = SEED_STAFF_DATA.map((s) => ({
+const readCollection = async <T extends { id: string }>(collectionName: string): Promise<T[]> => {
+  const snap = await getDocs(collection(firestoreDb, collectionName));
+  return snap.docs.map((d) => {
+    const data = d.data() as Partial<T>;
+    return {
+      ...(data as T),
+      id: (data.id as string) || d.id
+    } as T;
+  });
+};
+
+const setCollection = async <T extends { id: string }>(collectionName: string, rows: T[]) => {
+  if (rows.length === 0) return;
+  const batch = writeBatch(firestoreDb);
+  rows.forEach((row) => batch.set(doc(firestoreDb, collectionName, row.id), row));
+  await batch.commit();
+};
+
+const upsertDoc = async <T extends { id: string }>(collectionName: string, row: T) => {
+  await setDoc(doc(firestoreDb, collectionName, row.id), row);
+};
+
+const upsertManyDocs = async <T extends { id: string }>(collectionName: string, rows: T[]) => {
+  if (rows.length === 0) return;
+  const batch = writeBatch(firestoreDb);
+  rows.forEach((row) => batch.set(doc(firestoreDb, collectionName, row.id), row));
+  await batch.commit();
+};
+
+const DB = {
+  getUsers: async (): Promise<User[]> => readCollection<User>(COLLECTIONS.users),
+  setUsers: async (users: User[]) => setCollection<User>(COLLECTIONS.users, users),
+  upsertUser: async (user: User) => upsertDoc<User>(COLLECTIONS.users, user),
+  getEvents: async (): Promise<CateringEvent[]> => readCollection<CateringEvent>(COLLECTIONS.events),
+  setEvents: async (events: CateringEvent[]) => setCollection<CateringEvent>(COLLECTIONS.events, events),
+  upsertEvent: async (event: CateringEvent) => upsertDoc<CateringEvent>(COLLECTIONS.events, event),
+  getAssignments: async (): Promise<Assignment[]> => readCollection<Assignment>(COLLECTIONS.assignments),
+  setAssignments: async (asg: Assignment[]) => setCollection<Assignment>(COLLECTIONS.assignments, asg),
+  upsertAssignment: async (asg: Assignment) => upsertDoc<Assignment>(COLLECTIONS.assignments, asg),
+  upsertAssignments: async (asg: Assignment[]) => upsertManyDocs<Assignment>(COLLECTIONS.assignments, asg),
+  
+  init: async () => {
+    const existingUsers = await DB.getUsers();
+
+    const byIdOrEmail = new Map<string, User>();
+    existingUsers.forEach((u) => {
+      const key = u.id || normalizeEmail(u.email || '');
+      if (key) byIdOrEmail.set(key, u);
+    });
+
+    const upsertSeedUser = (seed: User) => {
+      const emailKey = normalizeEmail(seed.email);
+      const existing =
+        byIdOrEmail.get(seed.id) ||
+        Array.from(byIdOrEmail.values()).find((u) => normalizeEmail(u.email) === emailKey);
+
+      const merged: User = {
+        ...seed,
+        ...(existing || {}),
+        id: seed.id,
+        email: seed.email,
+        role: seed.role,
+        isContractor: typeof existing?.isContractor === 'boolean' ? existing.isContractor : seed.isContractor,
+        isPermanent: !(typeof existing?.isContractor === 'boolean' ? existing.isContractor : seed.isContractor),
+        isActive: typeof existing?.isActive === 'boolean' ? existing.isActive : true,
+        password: existing?.password || seed.password
+      };
+
+      byIdOrEmail.set(seed.id, merged);
+    };
+
+    upsertSeedUser(SEED_MANAGER);
+
+    SEED_STAFF_DATA.forEach((s) => {
+      upsertSeedUser({
         id: s.uid,
         name: s.name,
         email: s.email,
@@ -138,13 +203,15 @@ const DB = {
         isPermanent: !s.isContractor,
         isContractor: s.isContractor,
         isActive: true
-      }));
-      DB.setUsers([SEED_MANAGER, ...staffUsers]);
-      
-      if (existingUsers.length === 0) {
-        if (!localStorage.getItem('mbc_events')) DB.setEvents([]);
-        if (!localStorage.getItem('mbc_assignments')) DB.setAssignments([]);
-      }
+      });
+    });
+
+    const mergedUsers = Array.from(byIdOrEmail.values());
+    await DB.setUsers(mergedUsers);
+
+    if (existingUsers.length === 0) {
+      await DB.setEvents([]);
+      await DB.setAssignments([]);
     }
   }
 };
@@ -281,8 +348,16 @@ export default function App() {
 
   // Hydrate Data on Mount
   useEffect(() => {
-    DB.init();
-    refreshData();
+    const bootstrap = async () => {
+      try {
+        await DB.init();
+        await refreshData();
+      } catch (error) {
+        console.error('Bootstrap failed:', error);
+      }
+    };
+    bootstrap();
+
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       if (!firebaseUser) {
         setCurrentUser(null);
@@ -291,7 +366,14 @@ export default function App() {
       }
 
       const email = normalizeEmail(firebaseUser.email || '');
-      const localUsers = DB.getUsers();
+      let localUsers: User[] = [];
+      let hasUserStore = true;
+      try {
+        localUsers = await DB.getUsers();
+      } catch (error) {
+        hasUserStore = false;
+        console.error('Failed to load users during auth hydration:', error);
+      }
       const seedStaff = SEED_STAFF_DATA.find((s) => s.uid === firebaseUser.uid || normalizeEmail(s.email) === email);
       const localUser = localUsers.find((u) => u.id === firebaseUser.uid) || localUsers.find((u) => normalizeEmail(u.email) === email);
 
@@ -317,7 +399,7 @@ export default function App() {
         role = 'Manager';
         name = SEED_MANAGER.name;
         isContractor = false;
-      } else if (!seedStaff && !localUser) {
+      } else if (hasUserStore && !seedStaff && !localUser) {
         await firebaseSignOut(auth);
         setCurrentUser(null);
         setView('dashboard');
@@ -341,19 +423,27 @@ export default function App() {
         isActive
       };
 
-      const mergedUsers = DB.getUsers();
-      const existingIdx = mergedUsers.findIndex((u) => u.id === hydratedUser.id || normalizeEmail(u.email) === email);
-      if (existingIdx >= 0) {
-        const existingPassword = mergedUsers[existingIdx].password;
-        mergedUsers[existingIdx] = { ...hydratedUser, password: existingPassword };
-      } else {
-        mergedUsers.push(hydratedUser);
+      try {
+        const mergedUsers = await DB.getUsers();
+        const existingIdx = mergedUsers.findIndex((u) => u.id === hydratedUser.id || normalizeEmail(u.email) === email);
+        if (existingIdx >= 0) {
+          const existingPassword = mergedUsers[existingIdx].password;
+          mergedUsers[existingIdx] = { ...hydratedUser, password: existingPassword };
+        } else {
+          mergedUsers.push(hydratedUser);
+        }
+        await DB.setUsers(mergedUsers);
+      } catch (error) {
+        console.error('Failed to persist hydrated user:', error);
       }
-      DB.setUsers(mergedUsers);
 
       setCurrentUser(hydratedUser);
       setView('dashboard');
-      refreshData();
+      try {
+        await refreshData();
+      } catch (error) {
+        console.error('Post-login refresh failed:', error);
+      }
     });
 
     return () => unsub();
@@ -367,10 +457,16 @@ export default function App() {
     setEventsPage(1);
   }, [eventsSearch]);
 
-  const refreshData = () => {
-    setUsers(DB.getUsers());
-    setEvents(DB.getEvents());
-    setAssignments(DB.getAssignments());
+  const refreshData = async () => {
+    const [usersResult, eventsResult, assignmentsResult] = await Promise.allSettled([
+      DB.getUsers(),
+      DB.getEvents(),
+      DB.getAssignments()
+    ]);
+
+    if (usersResult.status === 'fulfilled') setUsers(usersResult.value);
+    if (eventsResult.status === 'fulfilled') setEvents(eventsResult.value);
+    if (assignmentsResult.status === 'fulfilled') setAssignments(assignmentsResult.value);
   };
 
   const managerStaff = users.filter((u) => u.role === 'Staff');
@@ -425,7 +521,7 @@ export default function App() {
 
   // --- ACTIONS ---
 
-  const createEvent = (e: React.FormEvent) => {
+  const createEvent = async (e: React.FormEvent) => {
     e.preventDefault();
     const form = e.target as HTMLFormElement;
     const formData = new FormData(form);
@@ -446,13 +542,17 @@ export default function App() {
       createdBy: currentUser!.id
     };
 
-    const updatedEvents = [...events, newEvent];
-    DB.setEvents(updatedEvents);
-    refreshData();
-    setView('events');
+    try {
+      await DB.upsertEvent(newEvent);
+      setEvents((prev) => [...prev, newEvent]);
+      setView('events');
+    } catch (error) {
+      console.error('Failed to create event:', error);
+      alert('Could not create event. Please try again.');
+    }
   };
 
-  const handleAddStaff = (e: React.FormEvent) => {
+  const handleAddStaff = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newStaffName.trim()) return;
 
@@ -475,17 +575,22 @@ export default function App() {
       isActive: true
     };
 
-    const updatedUsers = [...users, newUser];
-    DB.setUsers(updatedUsers);
-    refreshData();
-    setShowAddStaffModal(false);
-    setNewStaffName('');
-    setNewStaffType('Permanent');
-    alert(`Staff Added!\nEmail: ${email}\nPassword: ${password}`);
+    try {
+      await DB.upsertUser(newUser);
+      setUsers((prev) => [...prev, newUser]);
+      setShowAddStaffModal(false);
+      setNewStaffName('');
+      setNewStaffType('Permanent');
+      alert(`Staff Added!\nEmail: ${email}\nPassword: ${password}`);
+    } catch (error) {
+      console.error('Failed to add staff:', error);
+      alert('Could not add staff. Please try again.');
+    }
   };
 
-  const assignStaff = (eventId: string, staffIds: string[]) => {
-    const newAssignments = staffIds.map(sid => ({
+  const assignStaff = async (eventId: string, staffIds: string[]) => {
+    const safeStaffIds = staffIds.filter((sid): sid is string => typeof sid === 'string' && sid.trim().length > 0);
+    const newAssignments = safeStaffIds.map(sid => ({
       id: `asg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       eventId,
       staffId: sid,
@@ -500,11 +605,19 @@ export default function App() {
     const existing = assignments.filter(a => a.eventId === eventId);
     const uniqueNew = newAssignments.filter(n => !existing.find(e => e.staffId === n.staffId));
 
-    DB.setAssignments([...assignments, ...uniqueNew]);
-    refreshData();
+    if (uniqueNew.length === 0) return;
+
+    try {
+      await DB.upsertAssignments(uniqueNew);
+      setAssignments((prev) => [...prev, ...uniqueNew]);
+    } catch (error) {
+      console.error('Failed to assign staff:', error);
+      const err = error as { code?: string; message?: string };
+      alert(`Could not assign staff. ${err.code ? `(${err.code}) ` : ''}${err.message || ''}`.trim());
+    }
   };
 
-  const updateAssignment = (id: string, updates: Partial<Assignment>) => {
+  const updateAssignment = async (id: string, updates: Partial<Assignment>) => {
     // Optimistic Update for UI speed
     const newAssignments = assignments.map(a => {
       if (a.id === id) {
@@ -560,8 +673,15 @@ export default function App() {
     
     // Update State Immediately
     setAssignments(newAssignments);
-    // Persist
-    DB.setAssignments(newAssignments);
+    // Persist only the changed assignment to avoid full-collection write lag
+    const changed = newAssignments.find((a) => a.id === id);
+    if (changed) {
+      try {
+        await DB.upsertAssignment(changed);
+      } catch (error) {
+        console.error('Failed to update assignment:', error);
+      }
+    }
   };
 
   // --- PDF GENERATOR ---
