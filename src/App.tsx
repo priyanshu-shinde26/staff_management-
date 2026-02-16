@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Users, Calendar, DollarSign, LogOut, Plus, 
   CheckCircle, XCircle, FileText, ChevronRight, 
@@ -30,6 +30,7 @@ interface CateringEvent {
   id: string;
   eventName: string;
   eventDate: string;
+  eventTime?: string;
   shift: Shift;
   location: string;
   description: string;
@@ -149,10 +150,25 @@ const upsertManyDocs = async <T extends { id: string }>(collectionName: string, 
   await batch.commit();
 };
 
+const usersEquivalent = (a: User | undefined, b: User) => {
+  if (!a) return false;
+  return (
+    a.id === b.id &&
+    a.name === b.name &&
+    normalizeEmail(a.email) === normalizeEmail(b.email) &&
+    a.role === b.role &&
+    !!a.isPermanent === !!b.isPermanent &&
+    !!a.isContractor === !!b.isContractor &&
+    !!a.isActive === !!b.isActive &&
+    (a.password || '') === (b.password || '')
+  );
+};
+
 const DB = {
   getUsers: async (): Promise<User[]> => readCollection<User>(COLLECTIONS.users),
   setUsers: async (users: User[]) => setCollection<User>(COLLECTIONS.users, users),
   upsertUser: async (user: User) => upsertDoc<User>(COLLECTIONS.users, user),
+  upsertUsers: async (users: User[]) => upsertManyDocs<User>(COLLECTIONS.users, users),
   getEvents: async (): Promise<CateringEvent[]> => readCollection<CateringEvent>(COLLECTIONS.events),
   setEvents: async (events: CateringEvent[]) => setCollection<CateringEvent>(COLLECTIONS.events, events),
   upsertEvent: async (event: CateringEvent) => upsertDoc<CateringEvent>(COLLECTIONS.events, event),
@@ -207,7 +223,9 @@ const DB = {
     });
 
     const mergedUsers = Array.from(byIdOrEmail.values());
-    await DB.setUsers(mergedUsers);
+    const existingById = new Map(existingUsers.map((u) => [u.id, u]));
+    const usersToUpsert = mergedUsers.filter((u) => !usersEquivalent(existingById.get(u.id), u));
+    await DB.upsertUsers(usersToUpsert);
 
     if (existingUsers.length === 0) {
       await DB.setEvents([]);
@@ -224,17 +242,21 @@ const Login = () => {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const submitLockRef = useRef(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitLockRef.current || loading) return;
+    submitLockRef.current = true;
     setError('');
     setLoading(true);
     try {
-      await signInWithEmailAndPassword(auth, normalizeEmail(email), password);
+      await signInWithEmailAndPassword(auth, normalizeEmail(email.trim()), password);
     } catch {
       setError('Invalid credentials or unauthorized account.');
     } finally {
       setLoading(false);
+      submitLockRef.current = false;
     }
   };
 
@@ -276,10 +298,7 @@ const Login = () => {
           >
             {loading ? 'Signing In...' : 'Sign In'}
           </button>
-          <div className="mt-4 text-xs text-center text-gray-500">
-            <p>Manager: maabhawani2026@gmail.com / maabhawani2026</p>
-            <p className="mt-1">Staff: adarsh.rajurkar@maabhawani.com / MB@Adarsh2026</p>
-          </div>
+        
         </form>
       </div>
     </div>
@@ -343,16 +362,21 @@ export default function App() {
   const [showAddStaffModal, setShowAddStaffModal] = useState(false);
   const [newStaffName, setNewStaffName] = useState('');
   const [newStaffType, setNewStaffType] = useState('Permanent');
+  const [showExitToast, setShowExitToast] = useState(false);
+  const allowBrowserExitRef = useRef(false);
+  const createEventLockRef = useRef(false);
+  const lastCreatedEventSigRef = useRef<{ sig: string; at: number } | null>(null);
+  const assigningKeysRef = useRef<Set<string>>(new Set());
 
   // Create Event State
   const [eventType, setEventType] = useState(EVENT_TYPES[0]);
+  const [isCreatingEvent, setIsCreatingEvent] = useState(false);
 
   // Hydrate Data on Mount
   useEffect(() => {
     const bootstrap = async () => {
       try {
         await DB.init();
-        await refreshData();
       } catch (error) {
         console.error('Bootstrap failed:', error);
       }
@@ -367,40 +391,49 @@ export default function App() {
       }
 
       const email = normalizeEmail(firebaseUser.email || '');
-      let localUsers: User[] = [];
-      let hasUserStore = true;
-      try {
-        localUsers = await DB.getUsers();
-      } catch (error) {
-        hasUserStore = false;
-        console.error('Failed to load users during auth hydration:', error);
-      }
+      const isManagerEmail = email === normalizeEmail(SEED_MANAGER.email);
       const seedStaff = SEED_STAFF_DATA.find((s) => s.uid === firebaseUser.uid || normalizeEmail(s.email) === email);
-      const localUser = localUsers.find((u) => u.id === firebaseUser.uid) || localUsers.find((u) => normalizeEmail(u.email) === email);
-
-      let role: Role = 'Staff';
-      let name = seedStaff?.name || localUser?.name || (firebaseUser.displayName || email);
-      let isContractor = seedStaff?.isContractor ?? localUser?.isContractor ?? false;
-      let isActive = localUser?.isActive ?? true;
+      let localUsers: User[] = [];
+      let localUser: User | undefined;
+      let hasUserStore = true;
+      let userDocData: Partial<User> | null = null;
 
       try {
         const userSnap = await getDoc(doc(firestoreDb, 'users', firebaseUser.uid));
         if (userSnap.exists()) {
-          const data = userSnap.data() as Partial<User>;
-          if (data.role === 'Manager' || data.role === 'Staff') role = data.role;
-          if (data.name) name = data.name;
-          if (typeof data.isContractor === 'boolean') isContractor = data.isContractor;
-          if (typeof data.isActive === 'boolean') isActive = data.isActive;
+          userDocData = userSnap.data() as Partial<User>;
         }
       } catch {
         // Firestore role lookup is optional fallback.
       }
 
-      if (email === normalizeEmail(SEED_MANAGER.email)) {
+      if (!isManagerEmail && !seedStaff && !userDocData) {
+        try {
+          localUsers = await DB.getUsers();
+          localUser = localUsers.find((u) => u.id === firebaseUser.uid) || localUsers.find((u) => normalizeEmail(u.email) === email);
+        } catch (error) {
+          hasUserStore = false;
+          console.error('Failed to load users during auth hydration:', error);
+        }
+      }
+
+      let role: Role = 'Staff';
+      let name = seedStaff?.name || localUser?.name || userDocData?.name || (firebaseUser.displayName || email);
+      let isContractor = seedStaff?.isContractor ?? localUser?.isContractor ?? userDocData?.isContractor ?? false;
+      let isActive = localUser?.isActive ?? userDocData?.isActive ?? true;
+
+      if (userDocData) {
+        if (userDocData.role === 'Manager' || userDocData.role === 'Staff') role = userDocData.role;
+        if (userDocData.name) name = userDocData.name;
+        if (typeof userDocData.isContractor === 'boolean') isContractor = userDocData.isContractor;
+        if (typeof userDocData.isActive === 'boolean') isActive = userDocData.isActive;
+      }
+
+      if (isManagerEmail) {
         role = 'Manager';
         name = SEED_MANAGER.name;
         isContractor = false;
-      } else if (hasUserStore && !seedStaff && !localUser) {
+      } else if (hasUserStore && !seedStaff && !localUser && !userDocData) {
         await firebaseSignOut(auth);
         setCurrentUser(null);
         setView('dashboard');
@@ -424,27 +457,23 @@ export default function App() {
         isActive
       };
 
-      try {
-        const mergedUsers = await DB.getUsers();
-        const existingIdx = mergedUsers.findIndex((u) => u.id === hydratedUser.id || normalizeEmail(u.email) === email);
-        if (existingIdx >= 0) {
-          const existingPassword = mergedUsers[existingIdx].password;
-          mergedUsers[existingIdx] = { ...hydratedUser, password: existingPassword };
-        } else {
-          mergedUsers.push(hydratedUser);
-        }
-        await DB.setUsers(mergedUsers);
-      } catch (error) {
-        console.error('Failed to persist hydrated user:', error);
-      }
-
       setCurrentUser(hydratedUser);
       setView('dashboard');
-      try {
-        await refreshData();
-      } catch (error) {
-        console.error('Post-login refresh failed:', error);
-      }
+
+      const existingLocalUser =
+        localUser ||
+        localUsers.find((u) => u.id === hydratedUser.id) ||
+        localUsers.find((u) => normalizeEmail(u.email) === email);
+      const preservedPassword =
+        existingLocalUser?.password ||
+        (typeof userDocData?.password === 'string' ? userDocData.password : undefined);
+
+      void DB.upsertUser({
+          ...hydratedUser,
+          password: preservedPassword
+        }).catch((error) => {
+        console.error('Failed to persist hydrated user:', error);
+      });
     });
 
     return () => unsub();
@@ -541,6 +570,32 @@ export default function App() {
     };
   }, [currentUser]);
 
+  useEffect(() => {
+    if (!currentUser || view !== 'dashboard') {
+      setShowExitToast(false);
+      return;
+    }
+
+    allowBrowserExitRef.current = false;
+    const guardState = { app: 'staff-management-exit-guard', ts: Date.now() };
+    window.history.pushState(guardState, '', window.location.href);
+
+    const onPopState = () => {
+      if (allowBrowserExitRef.current) return;
+      setShowExitToast(true);
+      window.history.pushState({ ...guardState, ts: Date.now() }, '', window.location.href);
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [currentUser, view]);
+
+  const confirmExitWebsite = () => {
+    allowBrowserExitRef.current = true;
+    setShowExitToast(false);
+    window.history.back();
+  };
+
   const refreshData = async () => {
     const [usersResult, eventsResult, assignmentsResult] = await Promise.allSettled([
       DB.getUsers(),
@@ -556,6 +611,14 @@ export default function App() {
   const managerStaff = users.filter((u) => u.role === 'Staff');
   const todayISO = new Date().toISOString().split('T')[0];
   const isEventPast = (eventDate: string) => eventDate < todayISO;
+  const normalizeEventTime = (value: string) => {
+    const clean = value.trim().toUpperCase().replace(/\s+/g, ' ');
+    const match = clean.match(/^(0[1-9]|1[0-2]):([0-5][0-9])\s(AM|PM)$/);
+    if (!match) return null;
+    return `${match[1]}:${match[2]} ${match[3]}`;
+  };
+  const getEventDateTime = (event: CateringEvent) =>
+    event.eventTime ? `${event.eventDate} • ${event.eventTime}` : `${event.eventDate} • Time not set`;
   const activeEvents = events.filter((e) => !isEventPast(e.eventDate));
   const archivedEvents = events.filter((e) => isEventPast(e.eventDate));
 
@@ -576,7 +639,8 @@ export default function App() {
       return (
         e.eventName.toLowerCase().includes(q) ||
         e.location.toLowerCase().includes(q) ||
-        e.eventDate.toLowerCase().includes(q)
+        e.eventDate.toLowerCase().includes(q) ||
+        (e.eventTime || '').toLowerCase().includes(q)
       );
     })
     .slice()
@@ -591,7 +655,8 @@ export default function App() {
       return (
         e.eventName.toLowerCase().includes(q) ||
         e.location.toLowerCase().includes(q) ||
-        e.eventDate.toLowerCase().includes(q)
+        e.eventDate.toLowerCase().includes(q) ||
+        (e.eventTime || '').toLowerCase().includes(q)
       );
     })
     .slice()
@@ -607,32 +672,65 @@ export default function App() {
 
   const createEvent = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (createEventLockRef.current) return;
+    createEventLockRef.current = true;
+    setIsCreatingEvent(true);
     const form = e.target as HTMLFormElement;
     const formData = new FormData(form);
-    
-    // Logic for Event Name (Dropdown or Custom)
-    let finalEventName = eventType;
-    if (eventType === 'Other') {
-        finalEventName = formData.get('customEventName') as string;
-    }
-
-    const newEvent: CateringEvent = {
-      id: `evt-${Date.now()}`,
-      eventName: finalEventName,
-      eventDate: formData.get('eventDate') as string,
-      shift: formData.get('shift') as Shift,
-      location: formData.get('location') as string,
-      description: formData.get('description') as string,
-      createdBy: currentUser!.id
-    };
 
     try {
+      // Logic for Event Name (Dropdown or Custom)
+      let finalEventName = eventType;
+      if (eventType === 'Other') {
+          finalEventName = formData.get('customEventName') as string;
+      }
+      const eventHour = (formData.get('eventHour') as string) || '';
+      const eventMinute = (formData.get('eventMinute') as string) || '';
+      const eventPeriod = (formData.get('eventPeriod') as string) || '';
+      const normalizedEventTime = normalizeEventTime(`${eventHour}:${eventMinute} ${eventPeriod}`);
+      if (!normalizedEventTime) {
+        alert('Please enter reporting time in 12-hour format, e.g. 07:30 PM.');
+        return;
+      }
+      const normalizedName = finalEventName.trim().toLowerCase();
+      const normalizedLocation = ((formData.get('location') as string) || '').trim().toLowerCase();
+      const eventDate = (formData.get('eventDate') as string) || '';
+      const shift = formData.get('shift') as Shift;
+      const sig = `${normalizedName}|${eventDate}|${normalizedEventTime}|${shift}|${normalizedLocation}|${currentUser!.id}`;
+      const now = Date.now();
+      if (lastCreatedEventSigRef.current && lastCreatedEventSigRef.current.sig === sig && now - lastCreatedEventSigRef.current.at < 10000) {
+        return;
+      }
+      const alreadyExists = events.some((ev) => {
+        const evSig = `${ev.eventName.trim().toLowerCase()}|${ev.eventDate}|${ev.eventTime || ''}|${ev.shift}|${ev.location.trim().toLowerCase()}|${ev.createdBy}`;
+        return evSig === sig;
+      });
+      if (alreadyExists) {
+        alert('Same event already exists.');
+        return;
+      }
+
+      const newEvent: CateringEvent = {
+        id: `evt-${Date.now()}`,
+        eventName: finalEventName,
+        eventDate,
+        eventTime: normalizedEventTime,
+        shift,
+        location: (formData.get('location') as string) || '',
+        description: formData.get('description') as string,
+        createdBy: currentUser!.id
+      };
+
       await DB.upsertEvent(newEvent);
-      setEvents((prev) => [...prev, newEvent]);
+      lastCreatedEventSigRef.current = { sig, at: now };
+      setEvents((prev) => (prev.some((ev) => ev.id === newEvent.id) ? prev : [...prev, newEvent]));
       setView('events');
     } catch (error) {
       console.error('Failed to create event:', error);
       alert('Could not create event. Please try again.');
+    } finally {
+      createEventLockRef.current = false;
+      setIsCreatingEvent(false);
     }
   };
 
@@ -673,31 +771,59 @@ export default function App() {
   };
 
   const assignStaff = async (eventId: string, staffIds: string[]) => {
-    const safeStaffIds = staffIds.filter((sid): sid is string => typeof sid === 'string' && sid.trim().length > 0);
-    const newAssignments = safeStaffIds.map(sid => ({
-      id: `asg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      eventId,
-      staffId: sid,
-      availabilityStatus: 'Pending' as Availability,
-      attendanceStatus: 'Not Marked' as Attendance,
-      paymentAmount: 500, // Current active pay
-      basePaymentAmount: 500, // Agreed base pay (manager default)
-      paymentReceived: false,
-      markedByManager: false
-    }));
-
-    const existing = assignments.filter(a => a.eventId === eventId);
-    const uniqueNew = newAssignments.filter(n => !existing.find(e => e.staffId === n.staffId));
-
-    if (uniqueNew.length === 0) return;
+    const safeStaffIds = Array.from(new Set(staffIds.filter((sid): sid is string => typeof sid === 'string' && sid.trim().length > 0)));
+    const unlockedStaffIds = safeStaffIds.filter((sid) => {
+      const key = `${eventId}::${sid}`;
+      if (assigningKeysRef.current.has(key)) return false;
+      assigningKeysRef.current.add(key);
+      return true;
+    });
+    if (unlockedStaffIds.length === 0) return;
 
     try {
-      await DB.upsertAssignments(uniqueNew);
-      setAssignments((prev) => [...prev, ...uniqueNew]);
+      const existingForEvent = assignments.filter((a) => a.eventId === eventId);
+      const existingByStaff = new Map(existingForEvent.map((a) => [a.staffId, a]));
+      const staleIdsToDelete: string[] = [];
+      const toUpsert: Assignment[] = [];
+
+      unlockedStaffIds.forEach((sid) => {
+        const deterministicId = `asg-${eventId}-${sid}`;
+        const existing = existingByStaff.get(sid);
+        if (existing && existing.id === deterministicId) return;
+        if (existing && existing.id !== deterministicId) staleIdsToDelete.push(existing.id);
+
+        toUpsert.push({
+          id: deterministicId,
+          eventId,
+          staffId: sid,
+          availabilityStatus: 'Pending' as Availability,
+          attendanceStatus: 'Not Marked' as Attendance,
+          paymentAmount: 500,
+          basePaymentAmount: 500,
+          paymentReceived: false,
+          markedByManager: false
+        });
+      });
+
+      if (toUpsert.length === 0 && staleIdsToDelete.length === 0) return;
+
+      const batch = writeBatch(firestoreDb);
+      staleIdsToDelete.forEach((id) => batch.delete(doc(firestoreDb, COLLECTIONS.assignments, id)));
+      toUpsert.forEach((asg) => batch.set(doc(firestoreDb, COLLECTIONS.assignments, asg.id), asg));
+      await batch.commit();
+
+      setAssignments((prev) => {
+        const withoutStale = prev.filter((a) => !staleIdsToDelete.includes(a.id));
+        const byId = new Map(withoutStale.map((a) => [a.id, a]));
+        toUpsert.forEach((a) => byId.set(a.id, a));
+        return Array.from(byId.values());
+      });
     } catch (error) {
       console.error('Failed to assign staff:', error);
       const err = error as { code?: string; message?: string };
       alert(`Could not assign staff. ${err.code ? `(${err.code}) ` : ''}${err.message || ''}`.trim());
+    } finally {
+      unlockedStaffIds.forEach((sid) => assigningKeysRef.current.delete(`${eventId}::${sid}`));
     }
   };
 
@@ -765,6 +891,52 @@ export default function App() {
       } catch (error) {
         console.error('Failed to update assignment:', error);
       }
+    }
+  };
+
+  const deleteEvent = async (eventId: string) => {
+    if (!currentUser || currentUser.role !== 'Manager') return;
+    const eventToDelete = events.find((ev) => ev.id === eventId);
+    if (!eventToDelete) return;
+    const linkedAssignments = assignments.filter((a) => a.eventId === eventId);
+    const ok = confirm(
+      `Delete "${eventToDelete.eventName}" on ${getEventDateTime(eventToDelete)}?\nThis will remove ${linkedAssignments.length} staff assignment(s).`
+    );
+    if (!ok) return;
+
+    try {
+      const batch = writeBatch(firestoreDb);
+      batch.delete(doc(firestoreDb, COLLECTIONS.events, eventId));
+      linkedAssignments.forEach((a) => {
+        batch.delete(doc(firestoreDb, COLLECTIONS.assignments, a.id));
+      });
+      await batch.commit();
+      setEvents((prev) => prev.filter((ev) => ev.id !== eventId));
+      setAssignments((prev) => prev.filter((a) => a.eventId !== eventId));
+      setSelectedEventId(null);
+      setView('events');
+    } catch (error) {
+      console.error('Failed to delete event:', error);
+      alert('Could not delete event. Please try again.');
+    }
+  };
+
+  const removeAssignedStaff = async (assignmentId: string) => {
+    if (!currentUser || currentUser.role !== 'Manager') return;
+    const assignment = assignments.find((a) => a.id === assignmentId);
+    if (!assignment) return;
+    const staff = users.find((u) => u.id === assignment.staffId);
+    const ok = confirm(`Remove ${staff?.name || 'this staff'} from this event?`);
+    if (!ok) return;
+
+    try {
+      const batch = writeBatch(firestoreDb);
+      batch.delete(doc(firestoreDb, COLLECTIONS.assignments, assignmentId));
+      await batch.commit();
+      setAssignments((prev) => prev.filter((a) => a.id !== assignmentId));
+    } catch (error) {
+      console.error('Failed to remove assigned staff:', error);
+      alert('Could not remove assigned staff. Please try again.');
     }
   };
 
@@ -838,7 +1010,7 @@ export default function App() {
        htmlContent += `
          <tr>
            ${mode === 'all' ? `<td>${st.name}</td>` : ''}
-           <td>${ev.eventDate}</td>
+           <td>${getEventDateTime(ev)}</td>
            <td>${ev.eventName}</td>
            <td>${ev.shift}</td>
            <td>${a.attendanceStatus}</td>
@@ -1046,6 +1218,7 @@ export default function App() {
                         </div>
                         <div className="text-sm text-gray-500 mt-1 flex items-center space-x-4">
                           <span className="flex items-center"><Calendar size={14} className="mr-1"/> {event.eventDate}</span>
+                          <span className="flex items-center"><Clock size={14} className="mr-1"/> {event.eventTime || 'Time not set'}</span>
                           <span className="flex items-center"><MapPin size={14} className="mr-1"/> {event.location}</span>
                         </div>
                       </div>
@@ -1138,7 +1311,7 @@ export default function App() {
                     <h3 className="font-semibold text-slate-800">{ev.eventName}</h3>
                     <span className="text-xs px-2 py-1 rounded-full bg-slate-100 text-slate-700">{ev.shift}</span>
                   </div>
-                  <p className="text-sm text-slate-500 mt-2">{ev.eventDate}</p>
+                  <p className="text-sm text-slate-500 mt-2">{getEventDateTime(ev)}</p>
                   <p className="text-sm text-slate-500">{ev.location}</p>
                   <p className="text-xs text-slate-400 mt-2">Assigned: {assignments.filter(a => a.eventId === ev.id).length}</p>
                   <button onClick={() => { setSelectedEventId(ev.id); setView('eventDetails'); }} className="mt-3 min-h-11 w-full rounded-xl bg-slate-900 text-white text-sm font-medium">Details</button>
@@ -1164,7 +1337,7 @@ export default function App() {
                     {paginatedEvents.map((ev, idx) => (
                       <tr key={ev.id} className={`${idx % 2 === 0 ? 'bg-white' : 'bg-slate-50/40'} hover:bg-amber-50`}>
                         <td className="px-6 py-4 whitespace-nowrap font-medium text-slate-900">{ev.eventName}</td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{ev.eventDate} <br/><span className="text-xs bg-slate-100 px-1 rounded">{ev.shift}</span></td>
+                        <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{getEventDateTime(ev)} <br/><span className="text-xs bg-slate-100 px-1 rounded">{ev.shift}</span></td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{ev.location}</td>
                         <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">
                           {assignments.filter(a => a.eventId === ev.id).length}
@@ -1210,7 +1383,7 @@ export default function App() {
                   <div key={`arch-${ev.id}`} className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200">
                     <div>
                       <p className="text-sm font-medium text-slate-800">{ev.eventName}</p>
-                      <p className="text-xs text-slate-500">{ev.eventDate} • {ev.location}</p>
+                      <p className="text-xs text-slate-500">{getEventDateTime(ev)} • {ev.location}</p>
                     </div>
                     <button
                       onClick={() => { setSelectedEventId(ev.id); setView('eventDetails'); }}
@@ -1255,13 +1428,49 @@ export default function App() {
                   <input name="eventDate" required type="date" className="mt-1 block w-full min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none" />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-slate-700">Shift</label>
-                  <select name="shift" className="mt-1 block w-full min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none">
-                    <option>Morning</option>
-                    <option>Afternoon</option>
-                    <option>Night</option>
-                  </select>
+                  <label className="block text-sm font-medium text-slate-700">Reporting Time (12-hour)</label>
+                  <div className="mt-1 grid grid-cols-3 gap-2">
+                    <select
+                      name="eventHour"
+                      required
+                      defaultValue="07"
+                      className="min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+                    >
+                      {Array.from({ length: 12 }, (_, i) => {
+                        const hour = String(i + 1).padStart(2, '0');
+                        return <option key={hour} value={hour}>{hour}</option>;
+                      })}
+                    </select>
+                    <select
+                      name="eventMinute"
+                      required
+                      defaultValue="00"
+                      className="min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+                    >
+                      {Array.from({ length: 12 }, (_, i) => {
+                        const minute = String(i * 5).padStart(2, '0');
+                        return <option key={minute} value={minute}>{minute}</option>;
+                      })}
+                    </select>
+                    <select
+                      name="eventPeriod"
+                      required
+                      defaultValue="PM"
+                      className="min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
+                    >
+                      <option value="AM">AM</option>
+                      <option value="PM">PM</option>
+                    </select>
+                  </div>
                 </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-slate-700">Shift</label>
+                <select name="shift" className="mt-1 block w-full min-h-11 border border-slate-300 rounded-xl px-3 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none">
+                  <option>Morning</option>
+                  <option>Afternoon</option>
+                  <option>Night</option>
+                </select>
               </div>
               <div>
                 <label className="block text-sm font-medium text-slate-700">Location</label>
@@ -1273,7 +1482,13 @@ export default function App() {
               </div>
               <div className="pt-4 flex flex-col sm:flex-row gap-3">
                 <button type="button" onClick={() => setView('events')} className="min-h-11 px-4 py-2 border border-slate-300 rounded-xl text-slate-700 hover:bg-slate-50">Cancel</button>
-                <button type="submit" className="min-h-11 px-4 py-2 bg-amber-600 text-white rounded-xl hover:bg-amber-700">Save Event</button>
+                <button
+                  type="submit"
+                  disabled={isCreatingEvent}
+                  className="min-h-11 px-4 py-2 bg-amber-600 text-white rounded-xl hover:bg-amber-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                >
+                  {isCreatingEvent ? 'Saving...' : 'Save Event'}
+                </button>
               </div>
             </form>
           </div>
@@ -1284,7 +1499,17 @@ export default function App() {
           <div className="space-y-6">
             <div className="flex items-center justify-between">
                <button onClick={() => setView('events')} className="text-gray-500 hover:text-gray-900 flex items-center"><ChevronRight className="rotate-180 mr-1"/> Back</button>
-               <h2 className="text-xl font-bold">Event Management Details</h2>
+               <div className="flex items-center gap-3">
+                 <h2 className="text-xl font-bold">Event Management Details</h2>
+                 {currentUser.role === 'Manager' && (
+                   <button
+                     onClick={() => deleteEvent(selectedEventId)}
+                     className="min-h-10 px-3 rounded-lg border border-red-200 text-red-700 hover:bg-red-50 text-sm"
+                   >
+                     Delete Event
+                   </button>
+                 )}
+               </div>
             </div>
             
             {(() => {
@@ -1301,7 +1526,7 @@ export default function App() {
                    <div className="space-y-6">
                       <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
                         <h3 className="font-bold text-lg mb-2">{event.eventName}</h3>
-                        <p className="text-gray-500 text-sm mb-4">{event.eventDate} | {event.shift}</p>
+                        <p className="text-gray-500 text-sm mb-4">{getEventDateTime(event)} | {event.shift}</p>
                         <p className="text-gray-600 text-sm">{event.description || 'No description provided.'}</p>
                       </div>
 
@@ -1364,6 +1589,13 @@ export default function App() {
                                    className="w-full min-h-11 text-sm border border-slate-300 rounded-xl p-2"
                                  />
                                </div>
+                               <button
+                                 type="button"
+                                 onClick={() => removeAssignedStaff(asg.id)}
+                                 className="w-full min-h-11 rounded-xl border border-red-200 text-red-700 hover:bg-red-50 text-sm"
+                               >
+                                 Remove Staff
+                               </button>
                              </div>
                            </details>
                          );
@@ -1378,6 +1610,7 @@ export default function App() {
                            <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Attendance</th>
                            <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">Payment (₹)</th>
                            <th className="px-4 py-3 text-center text-xs font-medium text-slate-500 uppercase">Received?</th>
+                           <th className="px-4 py-3 text-right text-xs font-medium text-slate-500 uppercase">Action</th>
                          </tr>
                        </thead>
                        <tbody className="bg-white divide-y divide-slate-200">
@@ -1421,11 +1654,20 @@ export default function App() {
                                    <span className="text-gray-300">-</span>
                                  )}
                                </td>
+                               <td className="px-4 py-3 text-sm text-right">
+                                 <button
+                                   type="button"
+                                   onClick={() => removeAssignedStaff(asg.id)}
+                                   className="text-red-700 hover:text-red-800"
+                                 >
+                                   Remove
+                                 </button>
+                               </td>
                              </tr>
                            );
                          })}
                          {currentAssignments.length === 0 && (
-                           <tr><td colSpan={5} className="p-4 text-center text-gray-500 text-sm">No staff assigned yet.</td></tr>
+                           <tr><td colSpan={6} className="p-4 text-center text-gray-500 text-sm">No staff assigned yet.</td></tr>
                          )}
                        </tbody>
                      </table>
@@ -1632,7 +1874,7 @@ export default function App() {
                   return (
                     <div key={a.id} className="bg-white rounded-2xl border border-slate-200 p-4 shadow-sm">
                       <h3 className="font-semibold text-slate-800">{ev?.eventName}</h3>
-                      <p className="text-sm text-slate-500 mt-1">{ev?.eventDate}</p>
+                      <p className="text-sm text-slate-500 mt-1">{ev ? getEventDateTime(ev) : '-'}</p>
                       <div className="mt-2"><StatusBadge status={a.attendanceStatus} type="attend" /></div>
                       <p className="text-sm font-bold text-slate-800 mt-2">₹{a.paymentAmount}</p>
                       {a.paymentReceived ? (
@@ -1673,7 +1915,7 @@ export default function App() {
                       return (
                         <tr key={a.id} className="hover:bg-amber-50">
                           <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-slate-900">{ev?.eventName}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{ev?.eventDate}</td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{ev ? getEventDateTime(ev) : '-'}</td>
                           <td className="px-6 py-4 whitespace-nowrap text-sm">
                              <StatusBadge status={a.attendanceStatus} type="attend" />
                           </td>
@@ -1731,6 +1973,28 @@ export default function App() {
             ))}
           </div>
         </nav>
+        {showExitToast && (
+          <div className="fixed bottom-20 md:bottom-6 right-4 z-50 w-[min(92vw,360px)] rounded-xl border border-slate-200 bg-white shadow-lg p-4">
+            <p className="text-sm font-medium text-slate-800">Leave website?</p>
+            <p className="text-xs text-slate-500 mt-1">Press Leave to exit, or Stay to continue here.</p>
+            <div className="mt-3 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowExitToast(false)}
+                className="min-h-10 px-3 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-sm"
+              >
+                Stay
+              </button>
+              <button
+                type="button"
+                onClick={confirmExitWebsite}
+                className="min-h-10 px-3 rounded-lg bg-amber-600 text-white hover:bg-amber-700 text-sm"
+              >
+                Leave
+              </button>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
