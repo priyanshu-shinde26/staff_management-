@@ -798,8 +798,8 @@ export default function App() {
           staffId: sid,
           availabilityStatus: 'Pending' as Availability,
           attendanceStatus: 'Not Marked' as Attendance,
-          paymentAmount: 500,
-          basePaymentAmount: 500,
+          paymentAmount: 300,
+          basePaymentAmount: 300,
           paymentReceived: false,
           markedByManager: false
         });
@@ -833,7 +833,7 @@ export default function App() {
       if (a.id === id) {
         
         // 1. Resolve Base Amount (Migration for existing data that might lack basePaymentAmount)
-        const existingBase = a.basePaymentAmount ?? (a.paymentAmount > 0 ? a.paymentAmount : 500);
+        const existingBase = a.basePaymentAmount ?? (a.paymentAmount > 0 ? a.paymentAmount : 300);
         let newBase = existingBase;
 
         // If manager explicitly updates pay (via updates.paymentAmount), that becomes the new base
